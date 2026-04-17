@@ -1,0 +1,79 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+MANIFEST
+
+# ── Virtual environments ──────────────────────────────────────
+.env
+.venv
+env/
+venv/
+ENV/
+venvanpr/
+
+# ── Distribution / packaging ──────────────────────────────────
+*.whl
+*.tar.gz
+
+# ── Unit test / coverage ──────────────────────────────────────
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+htmlcov/
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ── Jupyter ───────────────────────────────────────────────────
+.ipynb_checkpoints
+*.ipynb
+
+# ── Logs & outputs ────────────────────────────────────────────
+*.log
+*.jsonl
+anpr_output/
+runs/
+
+# ── ML / model artifacts ──────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+datasets/
+*.yaml
+anpr_config.yml
+
+# ── Media / test files ────────────────────────────────────────
+*.mp4
+*.mov
+*.avi
+*.jpg
+*.jpeg
+*.png
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

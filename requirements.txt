@@ -1,0 +1,28 @@
+# ANPR — YOLO11 + PaddleOCR on NVIDIA Jetson
+# Install: pip install -r requirements.txt
+
+ultralytics>=8.3.0
+paddleocr>=2.7.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pyyaml>=6.0
+
+# ── PaddlePaddle (GPU build) ──────────────────────────────────
+# Do NOT install via pip on Jetson — use the official Jetson wheel.
+# Find yours at: https://www.paddlepaddle.org.cn/install/quick
+#   → Linux → Jetson → match your JetPack version
+#
+# Example for JetPack 5.x (CUDA 11.4):
+#   pip install paddlepaddle-gpu==2.6.1.post114 \
+#     -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html
+#
+# For x86 dev/testing only (not Jetson):
+#   pip install paddlepaddle-gpu
+# ANPR — YOLO11 + EasyOCR on NVIDIA Jetson (JetPack 6 / aarch64)
+# Install: pip install -r requirements.txt
+
+ultralytics>=8.3.0
+easyocr>=1.7.1
+opencv-python>=4.8.0
+numpy>=1.24.0
+pyyaml>=6.0
