@@ -723,22 +723,29 @@ def camera_worker(cam_cfg: dict, global_cfg: dict,
     votes:  VoteBuffer           = VoteBuffer(window=5.0, min_votes=5, px_tol=120)
     locked: dict[str, LockedSlot] = {}
 
-    # ── Bay watchdog ─────────────────────────────────────────────────────────
-    # All bay IDs monitored by this camera
+    # ── Bay occupancy tracking (detection-driven) ───────────────────────────
+    # Occupancy is driven by raw YOLO plate DETECTIONS inside a bay's region,
+    # independent of OCR success or plate-format validation. Any plate bbox
+    # inside a bay means a vehicle is physically parked there — even if the
+    # plate is dirty, angled, non-UAE, or otherwise unreadable.
     cam_bays: list[str] = [
         b for b in [
             cam_cfg.get("bay_id", ""),
             cam_cfg.get("bay_id_right", ""),
         ] if b
     ]
-    # Initialise last-locked timestamps far in the past so the watchdog fires
-    # on the very first cycle if no vehicle shows up — catches stale Occupied
-    # states left from a previous run or a failed startup init.
-    bay_last_locked: dict[str, float] = {
-        bid: time.monotonic() - absence_tout for bid in cam_bays
-    }
-    _watchdog_t: float = time.monotonic()   # next watchdog check timer
-    _WATCHDOG_INTERVAL = 30.0               # check every 30 s
+    bay_occ_cfg        = global_cfg.get("bay_occupancy", {})
+    occ_confirm_frames = int(bay_occ_cfg.get("confirm_frames", 3))
+    occ_absence_tout   = float(bay_occ_cfg.get("absence_timeout", absence_tout))
+
+    bay_det_streak:    dict[str, int]   = {bid: 0   for bid in cam_bays}
+    bay_last_det_mono: dict[str, float] = {bid: 0.0 for bid in cam_bays}
+    bay_occupied:      dict[str, bool]  = {bid: False for bid in cam_bays}
+
+    # Watchdog: sync local state with API at a slow cadence, recovering from
+    # drift (e.g. previous crash left bay marked Occupied on the server).
+    _watchdog_t: float = time.monotonic()
+    _WATCHDOG_INTERVAL = 30.0
 
     reconnect = int(cam_cfg.get("reconnect_delay", 5))
     is_rtsp   = bool(cam_cfg.get("rtsp"))
@@ -809,12 +816,44 @@ def camera_worker(cam_cfg: dict, global_cfg: dict,
                     log.debug(f"{tag} Detection conf={float(box.conf[0]):.3f} bbox=[{x1},{y1},{x2},{y2}] ratio={bw/bh:.2f}")
                     all_dets.append([x1,y1,x2,y2,float(box.conf[0])])
 
-        # ── Refresh locked slots ─────────────────────────────────
-        # Update bay_last_locked for every currently-active plate
-        for plate, slot in locked.items():
-            bid = resolve_bay_id(slot.bbox, fw, cam_cfg)
-            bay_last_locked[bid] = time.monotonic()
+        # ── Bay occupancy tracking (detection-driven) ────────────
+        # Run on every YOLO-inference frame. Flip Occupied after
+        # `confirm_frames` consecutive detection frames (suppresses flicker);
+        # flip Available after `absence_timeout` seconds with no detection in
+        # the bay's region.
+        if run_yolo:
+            bays_detected: set = set()
+            for det in all_dets:
+                bid = resolve_bay_id(det[:4], fw, cam_cfg)
+                if bid in bay_occupied:
+                    bays_detected.add(bid)
 
+            now_mono = time.monotonic()
+            for bid in cam_bays:
+                if bid in bays_detected:
+                    bay_last_det_mono[bid] = now_mono
+                    bay_det_streak[bid] += 1
+                    if (not bay_occupied[bid]
+                            and bay_det_streak[bid] >= occ_confirm_frames):
+                        if api.set_bay_occupied(bid):
+                            bay_occupied[bid] = True
+                            log.info(
+                                f"{tag} Bay {bid} → Occupied "
+                                f"(detection confirmed over {occ_confirm_frames} frames)"
+                            )
+                else:
+                    bay_det_streak[bid] = 0
+                    if (bay_occupied[bid]
+                            and bay_last_det_mono[bid] > 0
+                            and now_mono - bay_last_det_mono[bid] >= occ_absence_tout):
+                        if api.set_bay_available(bid):
+                            bay_occupied[bid] = False
+                            log.info(
+                                f"{tag} Bay {bid} → Available "
+                                f"(no detection for {occ_absence_tout:.0f}s)"
+                            )
+
+        # ── Refresh locked slots ─────────────────────────────────
         for plate, slot in list(locked.items()):
             seen = any(slot.bbox_overlap(d[:4]) for d in all_dets)
             if seen:
@@ -830,13 +869,14 @@ def camera_worker(cam_cfg: dict, global_cfg: dict,
                     f"departed={departed_at}  "
                     f"duration={duration_secs}s"
                 )
-                # Update API with departure
+                # Update API with departure event (exit_time)
+                # NOTE: bay occupancy status is handled by the detection-driven
+                # tracker above — not here. A lock departing only means we've
+                # lost tracking of the *plate*, not that the bay is empty.
                 dep_ok = False
                 if slot.api_event_id:
                     dep_ok = api.update_departure(slot.api_event_id, departed_at,
                                                    duration_secs)
-                # ── Bay occupancy: mark Available ──────────────────────────
-                api.set_bay_available(bay_id_dep)
 
                 event_log.departure(
                     plate=plate, bay_id=bay_id_dep,
@@ -852,30 +892,21 @@ def camera_worker(cam_cfg: dict, global_cfg: dict,
                 del locked[plate]
 
         # ── Bay watchdog ─────────────────────────────────────────
-        # Periodically: for each bay this camera owns, if no plate has been
-        # locked to it for >= absence_tout seconds AND the API status is not
-        # already 'Available', force it Available.  This recovers:
-        #   • Stale Occupied from a previous crash / failed departure call
-        #   • Failed startup init (cache status is '' which is also != 'Available')
+        # Periodically reconcile the local tracker with the API cache. Recovers
+        # from drift (e.g. a failed PUT that didn't update the dedup cache,
+        # or a stale Occupied on the server from a previous crash).
         now_mono = time.monotonic()
         if now_mono - _watchdog_t >= _WATCHDOG_INTERVAL:
             _watchdog_t = now_mono
-            active_bays = {
-                resolve_bay_id(s.bbox, fw, cam_cfg) for s in locked.values()
-            }
             for bid in cam_bays:
-                if bid in active_bays:
-                    continue               # vehicle is still locked — skip
-                age = now_mono - bay_last_locked[bid]
-                if age >= absence_tout:
-                    cached = api.get_cached_bay_status(bid)
-                    if cached != "Available":
-                        log.warning(
-                            "%s Watchdog: bay %s status=%r, no vehicle for %.0fs "
-                            "— forcing Available",
-                            tag, bid, cached or "<unknown>", age,
-                        )
-                        api.set_bay_available(bid)
+                desired = "Occupied" if bay_occupied[bid] else "Available"
+                cached  = api.get_cached_bay_status(bid)
+                if cached != desired:
+                    log.warning(
+                        "%s Watchdog: bay %s cache=%r, local=%s — resyncing",
+                        tag, bid, cached or "<unknown>", desired,
+                    )
+                    api.update_bay_status(bid, desired, force=True)
 
         # ── OCR on unlocked detections ───────────────────────────
         if frame_id % (skip + 1) == 0:
@@ -934,8 +965,9 @@ def camera_worker(cam_cfg: dict, global_cfg: dict,
             api_evt_id = api_resp.get("event_id", "") if api_resp else ""
             api_ok     = bool(api_evt_id)
 
-            # ── Bay occupancy: mark Occupied ───────────────────────────────
-            api.set_bay_occupied(bay_id)
+            # NOTE: bay_status Occupied is driven by the detection tracker
+            # above — not here. By the time we get here the bay was already
+            # flipped Occupied several frames ago.
 
             slot = LockedSlot(
                 plate=plate, bbox=v["bbox"],
